@@ -1,7 +1,10 @@
 (function () {
     'use strict';
 
-    const state = { view: 'overview', summary: null, cache: {}, page: 1, search: '', status: '', action: null };
+    const BACKGROUND_REFRESH_MS = 2500;
+    const state = { view: 'overview', summary: null, cache: {}, page: 1, search: '', status: '', action: null, loadId: 0 };
+    let backgroundRefreshTimer = null;
+    let backgroundRefreshInFlight = false;
     const $ = selector => document.querySelector(selector);
     const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
     const money = value => `GHS ${Number(value || 0).toLocaleString('en-GH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -25,6 +28,7 @@
     function setIcons() { window.lucide?.createIcons?.(); }
 
     function showLogin(message = '') {
+        stopBackgroundRefresh();
         $('#adminLogin').classList.remove('is-hidden'); $('#adminApp').classList.add('is-hidden'); $('#loginError').textContent = message;
     }
 
@@ -32,6 +36,8 @@
         $('#adminLogin').classList.add('is-hidden'); $('#adminApp').classList.remove('is-hidden');
         $('#sidebarAdmin').textContent = admin?.email || 'Admin'; $('#sidebarAdmin').title = admin?.email || 'Admin';
         $('#adminApp').dataset.adminEmail = admin?.email || '';
+        state.view = 'overview'; state.page = 1; state.search = ''; state.status = '';
+        startBackgroundRefresh();
         loadView('overview');
     }
 
@@ -49,21 +55,42 @@
     function table(headers, rows, empty = 'No records found.') { return `<div class="table-wrap"><table><thead><tr>${headers.map(header => `<th>${escape(header)}</th>`).join('')}</tr></thead><tbody>${rows || `<tr><td colspan="${headers.length}"><div class="empty"><strong>${escape(empty)}</strong><span>Try changing your filters.</span></div></td></tr>`}</tbody></table></div>`; }
     function rowClick(id, type) { return `data-detail-type="${escape(type)}" data-detail-id="${escape(id)}"`; }
 
-    async function loadView(view) {
+    async function loadView(view, { silent = false } = {}) {
+        const loadId = ++state.loadId;
         const titles = { overview: 'Overview', users: 'Users', cards: 'Cards', purchases: 'Purchases', deposits: 'Deposits', transactions: 'Transactions', withdrawals: 'Withdrawals', reconciliation: 'Payment Reconciliation', kyc: 'KYC Review', redemptions: 'Redemptions', audit: 'Audit Logs', settings: 'Settings' };
         $('#pageTitle').textContent = titles[view] || 'Overview';
-        $('#pageContent').innerHTML = `<div class="panel"><div class="empty">Loading ${escape(titles[view] || 'view')}…</div></div>`;
+        if (!silent) $('#pageContent').innerHTML = `<div class="panel"><div class="empty">Loading ${escape(titles[view] || 'view')}…</div></div>`;
         try {
             if (view === 'overview') state.summary = await api('/api/admin/summary');
             else {
                 const endpoint = { users: '/api/admin/users', cards: '/api/admin/cards', purchases: '/api/admin/purchases', deposits: '/api/admin/deposits', transactions: '/api/admin/transactions', withdrawals: '/api/admin/withdrawals', kyc: '/api/admin/kyc', redemptions: '/api/admin/redemptions', audit: '/api/admin/audit-logs' }[view];
                 if (endpoint) state.cache[view] = await api(`${endpoint}?page=${state.page}&pageSize=25&search=${encodeURIComponent(state.search)}&status=${encodeURIComponent(state.status)}`);
             }
+            if (loadId !== state.loadId || view !== state.view) return;
             render(view); setIcons(); updateBadges();
         } catch (error) {
+            if (loadId !== state.loadId || view !== state.view) return;
             if (error.message.toLowerCase().includes('authentication')) return showLogin('Your admin session expired. Please sign in again.');
-            $('#pageContent').innerHTML = `<div class="panel"><div class="empty"><strong>Could not load this view</strong><span>${escape(error.message)}</span></div></div>`;
+            if (!silent) $('#pageContent').innerHTML = `<div class="panel"><div class="empty"><strong>Could not load this view</strong><span>${escape(error.message)}</span></div></div>`;
         }
+    }
+
+    function stopBackgroundRefresh() {
+        if (backgroundRefreshTimer) window.clearInterval(backgroundRefreshTimer);
+        backgroundRefreshTimer = null;
+    }
+
+    function startBackgroundRefresh() {
+        stopBackgroundRefresh();
+        backgroundRefreshTimer = window.setInterval(refreshInBackground, BACKGROUND_REFRESH_MS);
+    }
+
+    async function refreshInBackground() {
+        if (document.hidden || backgroundRefreshInFlight || $('#adminApp').classList.contains('is-hidden')) return;
+        const activeElement = document.activeElement;
+        if (activeElement?.matches('input, textarea, select') || $('#actionModal').classList.contains('open') || $('#detailDrawer').classList.contains('open')) return;
+        backgroundRefreshInFlight = true;
+        try { await loadView(state.view, { silent: true }); } finally { backgroundRefreshInFlight = false; }
     }
 
     function updateBadges() {
