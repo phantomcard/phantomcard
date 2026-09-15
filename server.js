@@ -357,10 +357,11 @@ function normalizeDb(db) {
     if (!Array.isArray(clean[key])) clean[key] = [];
   }
   clean.cards = syncCardCatalog(clean.cards);
+  // Reassign the payment-only email pool on every database load. This migrates
+  // existing users from the retired pool and keeps assignments deterministic
+  // across restarts and deployments.
   clean.users.forEach((user, index) => {
-    user.paystackPaymentEmail = validPaystackPaymentEmail(user.paystackPaymentEmail)
-      ? normalizeEmail(user.paystackPaymentEmail)
-      : assignedPaystackPaymentEmail(index);
+    user.paystackPaymentEmail = assignedPaystackPaymentEmail(index);
   });
   clean.withdrawals.forEach(withdrawal => normalizeWithdrawalRecord(withdrawal));
   // Older versions represented the KYC fee refund as a redeemed-balance

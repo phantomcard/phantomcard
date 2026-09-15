@@ -164,11 +164,12 @@ test('users receive persistent allowed Paystack emails and repeated top-ups get 
   const third = await signup('Payment User Three', '0241234513', 'real-three@gmail.com');
   for (const result of [first, second, third]) {
     assert.equal(result.status, 201);
-    assert.ok(['danny700218+1@gmail.com', 'danny700218+2@gmail.com'].includes(result.data.user.paystackPaymentEmail));
+    assert.match(result.data.user.paystackPaymentEmail, /^(bridgetfegerson2007|jasonfegurson2007)\+\d+@gmail\.com$/);
     assert.notEqual(result.data.user.paystackPaymentEmail, result.data.user.email);
   }
-  assert.notEqual(first.data.user.paystackPaymentEmail, second.data.user.paystackPaymentEmail);
-  assert.equal(first.data.user.paystackPaymentEmail, third.data.user.paystackPaymentEmail);
+  assert.equal(first.data.user.paystackPaymentEmail, 'bridgetfegerson2007+1@gmail.com');
+  assert.equal(second.data.user.paystackPaymentEmail, 'bridgetfegerson2007+2@gmail.com');
+  assert.equal(third.data.user.paystackPaymentEmail, 'bridgetfegerson2007+3@gmail.com');
 
   const firstTopup = await request('/api/deposits', { method: 'POST', body: JSON.stringify({ amount: 30 }) }, first.cookie);
   const secondTopup = await request('/api/deposits', { method: 'POST', body: JSON.stringify({ amount: 30 }) }, first.cookie);
