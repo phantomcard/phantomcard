@@ -582,6 +582,17 @@ function verifySignedRequest(req, raw, secret, maxAgeMs = 5 * 60 * 1000) {
   const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${requestId}.${raw}`).digest('hex');
   return safeEqual(signature, expected);
 }
+async function askPaymentServiceToReconcile(paystackReference) {
+  if (!SITE_B_BASE_URL) throw new Error('Payment service is not configured.');
+  const response = await fetch(`${SITE_B_BASE_URL}/api/v1/payments/${encodeURIComponent(paystackReference)}/complete`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(15000),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'Payment service could not verify this transaction.');
+  return result;
+}
 function validTopup(deposit, user) { return deposit && user && deposit.userId === user.id && deposit.purpose === 'WALLET_TOPUP' && deposit.currency === PAYSTACK_CURRENCY && Number.isInteger(deposit.amountMinor) && deposit.amountMinor > 0; }
 function validKycBypass(payment, user) { return payment && user && payment.userId === user.id && Number(payment.amount) === KYC_BYPASS_FEE && payment.currency === PAYSTACK_CURRENCY; }
 function completeDeposit(db, deposit, provider) {
@@ -1168,7 +1179,35 @@ async function route(req, res) {
       const reference = decodeURIComponent(pathname.split('/')[4]); const deposit = db.deposits.find(item => item.transactionId === reference || item.reference === reference || item.paystackReference === reference);
       if (!deposit) return fail(res, 404, 'Deposit was not found.');
       const payment = (db.kycBypassPayments || []).find(item => item.reference === reference || item.paystackReference === reference);
-      return json(res, 200, { siteA: adminDepositRow(db, deposit), siteB: { transactionId: deposit.paymentServiceTransactionId || null, status: deposit.status === 'SUCCESS' ? 'SUCCESS' : deposit.status, availableThrough: 'Site B has no admin read API yet.' }, paystack: { reference: deposit.paystackReference || null, amountMinor: deposit.amountMinor || null, currency: deposit.currency || PAYSTACK_CURRENCY, status: deposit.status === 'SUCCESS' ? 'SUCCESS' : 'UNKNOWN' }, relatedKycBypass: payment || null });
+      return json(res, 200, { siteA: adminDepositRow(db, deposit), siteB: { transactionId: deposit.paymentServiceTransactionId || null, status: deposit.status === 'SUCCESS' ? 'SUCCESS' : deposit.status, availableThrough: 'Use Recheck payment to ask Site B to verify Paystack.' }, paystack: { reference: deposit.paystackReference || null, amountMinor: deposit.amountMinor || null, currency: deposit.currency || PAYSTACK_CURRENCY, status: deposit.status === 'SUCCESS' ? 'SUCCESS' : 'UNKNOWN' }, relatedKycBypass: payment || null });
+    }
+    if (req.method === 'POST' && /^\/api\/admin\/deposits\/[^/]+\/reconcile$/.test(pathname)) {
+      const admin = requireAdmin(req, res, db); if (!admin) return;
+      const reference = decodeURIComponent(pathname.split('/')[4]);
+      const deposit = db.deposits.find(item => item.transactionId === reference || item.reference === reference || item.paystackReference === reference);
+      if (!deposit) return fail(res, 404, 'Deposit was not found. Use the Site A, payment-service, or Paystack reference.');
+      const before = { status: deposit.status, amount: deposit.amount, reference: deposit.reference, paystackReference: deposit.paystackReference || null, walletCredited: deposit.status === 'SUCCESS' };
+      if (deposit.status === 'SUCCESS') {
+        adminAudit(db, { admin, action: 'deposit.reconcile.duplicate', targetType: 'deposit', targetId: deposit.reference, before, after: before, reason: 'Admin recheck requested for an already credited deposit.' });
+        save(db);
+        return json(res, 200, { ok: true, reconciled: true, duplicate: true, status: deposit.status, deposit: adminDepositRow(db, deposit), message: 'This deposit was already credited.' });
+      }
+      if (!deposit.paystackReference) return fail(res, 409, 'This deposit has no Paystack reference yet. Ask the customer for the Paystack reference or investigate the initialization failure.');
+      let serviceResult;
+      try {
+        serviceResult = await askPaymentServiceToReconcile(deposit.paystackReference);
+      } catch (error) {
+        adminAudit(db, { admin, action: 'deposit.reconcile.failed', targetType: 'deposit', targetId: deposit.reference, before, after: { status: deposit.status }, reason: `Payment-service recheck failed: ${error.message}` });
+        save(db);
+        return fail(res, 502, `Payment recheck failed: ${error.message}`);
+      }
+      const refreshedDb = load();
+      const refreshedDeposit = refreshedDb.deposits.find(item => item.reference === deposit.reference);
+      if (!refreshedDeposit) return fail(res, 404, 'Deposit disappeared while it was being reconciled.');
+      const after = { status: refreshedDeposit.status, amount: refreshedDeposit.amount, reference: refreshedDeposit.reference, paystackReference: refreshedDeposit.paystackReference || null, walletCredited: refreshedDeposit.status === 'SUCCESS' };
+      adminAudit(refreshedDb, { admin, action: refreshedDeposit.status === 'SUCCESS' ? 'deposit.reconcile.success' : 'deposit.reconcile.pending', targetType: 'deposit', targetId: refreshedDeposit.reference, before, after, reason: refreshedDeposit.status === 'SUCCESS' ? 'Paystack was verified and the wallet credit was reconciled.' : 'Paystack did not produce a completed wallet credit during the recheck.' });
+      save(refreshedDb);
+      return json(res, 200, { ok: true, reconciled: refreshedDeposit.status === 'SUCCESS', status: refreshedDeposit.status, deposit: adminDepositRow(refreshedDb, refreshedDeposit), paymentService: { status: serviceResult.message || null, reference: refreshedDeposit.paystackReference || null }, message: refreshedDeposit.status === 'SUCCESS' ? 'Payment verified and wallet credited.' : 'Payment is not confirmed yet; no wallet credit was applied.' });
     }
     if (req.method === 'POST' && /^\/api\/admin\/withdrawals\/[^/]+\/approve$/.test(pathname)) { const admin = requireAdmin(req, res, db); if (!admin) return; const ref = decodeURIComponent(pathname.split('/')[4]); const withdrawal = db.withdrawals.find(item => item.reference === ref); if (!withdrawal) return fail(res, 404, 'Withdrawal was not found.'); const before = { ...withdrawal }; const p = await body(req); const approved = approveWithdrawal(db, withdrawal, p.note); adminAudit(db, { admin, action: 'withdrawal.approve', targetType: 'withdrawal', targetId: ref, before, after: { ...withdrawal }, reason: p.note }); save(db); console.log('[withdrawal:approved]', ref); return json(res, 200, { ok: true, withdrawal: publicWithdrawal(approved.withdrawal), transaction: approved.transaction && publicTransaction(approved.transaction), receipt: approved.receipt && publicReceipt(approved.receipt) }); }
     if (req.method === 'POST' && /^\/api\/admin\/withdrawals\/[^/]+\/reject$/.test(pathname)) { const admin = requireAdmin(req, res, db); if (!admin) return; const ref = decodeURIComponent(pathname.split('/')[4]); const withdrawal = db.withdrawals.find(item => item.reference === ref); if (!withdrawal) return fail(res, 404, 'Withdrawal was not found.'); const before = { ...withdrawal }; const p = await body(req); const rejected = rejectWithdrawal(db, withdrawal, p.note); adminAudit(db, { admin, action: 'withdrawal.reject', targetType: 'withdrawal', targetId: ref, before, after: { ...withdrawal }, reason: p.note }); save(db); console.log('[withdrawal:rejected]', ref); return json(res, 200, { ok: true, withdrawal: publicWithdrawal(rejected.withdrawal), transaction: rejected.transaction && publicTransaction(rejected.transaction), receipt: rejected.receipt && publicReceipt(rejected.receipt) }); }
